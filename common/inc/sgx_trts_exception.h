@@ -161,6 +161,27 @@ void * SGXAPI sgx_register_exception_handler(int is_first_handler, sgx_exception
 */
 int SGXAPI sgx_unregister_exception_handler(void *handler);
 
+/* sgx_register_alt_stack()
+ *      register enclave memory as a stack that exceptions may be raised on,
+ *      e.g. a coroutine or fiber stack. Without it, an exception raised while
+ *      the stack pointer is outside the thread's stack crashes the enclave.
+ * Parameter
+ *      addr - lowest address of the stack (enclave memory).
+ *      size - size of the stack in bytes.
+ * Return Value
+ *      none zero - handle to pass to sgx_unregister_alt_stack
+ *              0 - fail
+*/
+size_t SGXAPI sgx_register_alt_stack(const void *addr, size_t size);
+
+/* sgx_unregister_alt_stack()
+ *      remove a stack registered with sgx_register_alt_stack.
+ * Return Value
+ *      none zero - success
+ *              0 - fail
+*/
+int SGXAPI sgx_unregister_alt_stack(size_t handle);
+
 
 #ifdef __cplusplus
 }

@@ -22,7 +22,10 @@ use crate::error;
 use crate::rand::rand;
 use crate::tcs::{current, stack_size, tcs_max_num, tcs_policy};
 use crate::trts::{cpu_core_num, enclave_mode, is_supported_edmm};
-use crate::veh::{register_exception, unregister, ExceptionHandler, Handle};
+use crate::veh::{
+    register_alt_stack, register_exception, unregister, unregister_alt_stack, ExceptionHandler,
+    Handle,
+};
 use core::convert::TryFrom;
 use core::ffi::c_void;
 use core::num::NonZeroUsize;
@@ -51,6 +54,21 @@ pub unsafe extern "C" fn sgx_unregister_exception_handler(handle: *const c_void)
     let handle = Handle::from_raw(handle as u64);
     let result = unregister(handle);
     i32::from(result)
+}
+
+/// Register enclave memory `[addr, addr + size)` as a stack that exceptions
+/// may be raised on (e.g. a coroutine or fiber stack). Returns a non-zero
+/// handle, or 0 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn sgx_register_alt_stack(addr: *const u8, size: usize) -> usize {
+    register_alt_stack(addr as usize, size).unwrap_or(0)
+}
+
+/// Remove a stack registered with `sgx_register_alt_stack`. Returns 1 on
+/// success, 0 otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn sgx_unregister_alt_stack(handle: usize) -> i32 {
+    i32::from(unregister_alt_stack(handle).is_ok())
 }
 
 #[no_mangle]

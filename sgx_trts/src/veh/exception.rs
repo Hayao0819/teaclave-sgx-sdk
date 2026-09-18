@@ -22,6 +22,7 @@ use crate::error;
 use crate::feature::SysFeatures;
 use crate::tcs::tc::{self, ThreadControl};
 use crate::trts;
+use crate::veh::altstack;
 use crate::veh::list;
 use crate::veh::MAX_REGISTER_COUNT;
 use crate::veh::{ExceptionHandler, ExceptionInfo, ExceptionType, ExceptionVector, HandleResult};
@@ -56,6 +57,35 @@ macro_rules! bool_to_integer {
     };
 }
 
+/// The stack an exception was raised on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExceptionStack {
+    /// The current thread's stack.
+    Thread,
+    /// A registered alternate stack `[limit, base)`, see [`altstack`].
+    Alt { limit: usize, base: usize },
+}
+
+impl ExceptionStack {
+    fn of(tds: &Tds, sp: usize) -> Option<ExceptionStack> {
+        if tds.is_stack_addr(sp, 0) {
+            return Some(ExceptionStack::Thread);
+        }
+        altstack::find(sp).map(|(limit, base)| ExceptionStack::Alt { limit, base })
+    }
+
+    /// Whether `[addr, addr + size]` lies in this stack.
+    fn contains(&self, tds: &Tds, addr: usize, size: usize) -> bool {
+        match *self {
+            ExceptionStack::Thread => tds.is_stack_addr(addr, size),
+            ExceptionStack::Alt { limit, base } => match addr.checked_add(size) {
+                Some(end) => limit <= addr && end <= base,
+                None => false,
+            },
+        }
+    }
+}
+
 extern "C" {
     fn restore_xregs(buf: *const u8);
     fn continue_execution(info: *const ExceptionInfo);
@@ -84,7 +114,7 @@ pub fn handle(tcs: &mut Tcs) -> SgxResult {
     );
 
     // no need to check the result of ssa_gpr because thread_data is always trusted
-    let mut sp = {
+    let (mut sp, stack) = {
         let ssa_gpr = tds.ssa_gpr();
         let sp_u = ssa_gpr.rsp_u as usize;
         let sp = ssa_gpr.rsp as usize;
@@ -95,8 +125,9 @@ pub fn handle(tcs: &mut Tcs) -> SgxResult {
         );
         try_error!(sp_u == sp, SgxStatus::StackOverRun);
         // check stack overrun only, alignment will be checked after exception handled
-        try_error!(!tds.is_stack_addr(sp, 0), SgxStatus::StackOverRun);
-        sp
+        let stack = ExceptionStack::of(tds, sp);
+        try_error!(stack.is_none(), SgxStatus::StackOverRun);
+        (sp, stack.unwrap())
     };
 
     let xsave_size = tds.xsave_size;
@@ -118,16 +149,18 @@ pub fn handle(tcs: &mut Tcs) -> SgxResult {
     sp &= !0x3F;
 
     // check the decreased sp to make sure it is in the trusted stack range
-    try_error!(!tds.is_stack_addr(sp, 0), SgxStatus::StackOverRun);
+    try_error!(!stack.contains(tds, sp, 0), SgxStatus::StackOverRun);
 
     let info = unsafe { &mut *(sp as *mut ExceptionInfo) };
     // decrease the stack to save the SSA[0]->ip
     sp -= mem::size_of::<usize>();
-    try_error!(!tds.is_stack_addr(sp, size));
+    try_error!(!stack.contains(tds, sp, size));
 
     let mut is_exception_handled = false;
     let exit_info_valid = tds.ssa_gpr_mut().exit_info.valid();
-    if exit_info_valid == 1 && sp < tds.stack_commit {
+    // An alternate stack is allocated whole by its owner; only the thread
+    // stack grows on demand.
+    if exit_info_valid == 1 && stack == ExceptionStack::Thread && sp < tds.stack_commit {
         // EDMM:
         // stack expand
         let mut result = SgxResult::<()>::Err(SgxStatus::StackOverRun);
@@ -348,7 +381,11 @@ extern "C" fn internal_handle(info: &mut ExceptionInfo) {
     // ignore invalid return value, treat to HandleResult::Search
     // check SP to be written on SSA is pointing to the trusted stack
     let rsp = info.context.rsp as usize;
-    try_abort!(!tds.is_valid_sp(rsp), tds);
+    try_abort!(
+        !(tds.is_valid_sp(rsp)
+            || ((rsp & (mem::size_of::<usize>() - 1)) == 0 && altstack::find(rsp).is_some())),
+        tds
+    );
 
     if result != HandleResult::Execution {
         tds.exception_flag = -1;
